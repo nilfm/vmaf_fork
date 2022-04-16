@@ -80,7 +80,7 @@ static const uint16_t g_c_value_histogram_offset = 4; // = -g_all_diffs[0]
         y = temp;         \
     }
 
-#define PICS_BUFFER_SIZE 3
+#define PICS_BUFFER_SIZE 4
 #define MASK_FILTER_SIZE 7
 
 typedef struct CambiBuffers {
@@ -610,7 +610,8 @@ static void decimate(VmafPicture *image, unsigned width, unsigned height) {
     }
 }
 
-static FORCE_INLINE inline uint16_t mode_selection(uint16_t *elems, uint8_t *hist) {
+static FORCE_INLINE inline uint16_t mode_selection(uint16_t *elems, uint8_t *hist)
+{
     unsigned max_counts = 0;
     uint16_t max_mode = 1024;
     // Set the 9 entries to 0
@@ -633,35 +634,30 @@ static FORCE_INLINE inline uint16_t mode_selection(uint16_t *elems, uint8_t *his
     return max_mode;
 }
 
-static void filter_mode(const VmafPicture *image, int width, int height) {
-    uint16_t *data = image->data[0];
-    ptrdiff_t stride = image->stride[0] >> 1;
-    uint16_t curr[9];
+static void filter_mode(const VmafPicture *image, VmafPicture *filtered_image,
+                        int width, int height)
+{
     uint8_t *hist = malloc(1024 * sizeof(uint8_t));
-    uint16_t *buffer = malloc(3 * width * sizeof(uint16_t));
-    for (int i = 0; i < height + 2; i++) {
-        if (i < height) {
-            for (int j = 0; j < width; j++) {
-                // Get the 9 elements into an array for cache optimization
-                for (int row = 0; row < 3; row++) {
-                    for (int col = 0; col < 3; col++) {
-                        int clamped_row = CLAMP(i + row - 1, 0, height - 1);
-                        int clamped_col = CLAMP(j + col - 1, 0, width - 1);
-                        curr[3 * row + col] = data[clamped_row * stride + clamped_col];
-                    }
+    uint16_t *data = image->data[0];
+    ptrdiff_t stride = image->stride[0]>>1;    
+    uint16_t *filtered_data = filtered_image->data[0];
+    ptrdiff_t out_stride = filtered_image->stride[0]>>1;
+    uint16_t curr[9];
+    for (int i=0; i<height; i++) {
+        for (int j=0; j<width; j++) {
+            // Get the 9 elements into an array for cache coherence
+            for (int row = 0; row < 3; row++) {
+                for (int col = 0; col < 3; col++) {
+                    int clamped_row = CLAMP(i + row - 1, 0, height - 1);
+                    int clamped_col = CLAMP(j + col - 1, 0, width - 1);
+                    curr[3 * row + col] = data[clamped_row * stride + clamped_col];
                 }
-                buffer[(i % 3) * width + j] = mode_selection(curr, hist);
             }
-        }
-        if (i >= 2) {
-            uint16_t *dest = data + (i - 2) * stride;
-            uint16_t *src = buffer + ((i + 1) % 3) * width;
-            memcpy(dest, src, width * sizeof(uint16_t));
+            filtered_data[i * out_stride + j] = mode_selection(curr, hist);
         }
     }
 
     free(hist);
-    free(buffer);
 }
 
 static FORCE_INLINE inline uint16_t ceil_log2(uint32_t num) {
@@ -924,6 +920,12 @@ static int dump_c_values(FILE *heatmaps_files[], const float *c_values, int widt
     return 0;
 }
 
+static void copy_10b_luma(const VmafPicture *pic, VmafPicture *out_pic)
+{
+    ptrdiff_t stride = pic->stride[0] >> 1;
+    memcpy(out_pic->data[0], pic->data[0], stride * pic->h[0] * sizeof(uint16_t));
+}
+
 static int cambi_score(VmafPicture *pics, uint16_t window_size, double topk,
                        const uint16_t num_diffs, const uint16_t *tvi_for_diff,
                        CambiBuffers buffers, VmafRangeUpdater inc_range_callback, VmafRangeUpdater dec_range_callback,
@@ -933,6 +935,7 @@ static int cambi_score(VmafPicture *pics, uint16_t window_size, double topk,
     VmafPicture *image = &pics[0];
     VmafPicture *mask = &pics[1];
     VmafPicture *zero_derivative = &pics[2];
+    VmafPicture *filtered_image = &pics[3];
 
     int scaled_width = width;
     int scaled_height = height;
@@ -946,9 +949,11 @@ static int cambi_score(VmafPicture *pics, uint16_t window_size, double topk,
             decimate(mask, scaled_width, scaled_height);
         }
 
-        filter_mode(image, scaled_width, scaled_height);
+        filter_mode(image, filtered_image, scaled_width, scaled_height);
+        if (scale < NUM_SCALES-1)
+            copy_10b_luma(filtered_image, image);
 
-        calculate_c_values(image, mask, buffers.c_values, window_size,
+        calculate_c_values(filtered_image, mask, buffers.c_values, window_size,
                            tvi_for_diff, scaled_width, scaled_height);
 
         if (write_heatmaps) {
