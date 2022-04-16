@@ -63,6 +63,13 @@ static const int g_scale_weights[NUM_SCALES] = {16, 8, 4, 2, 1};
 static const int g_contrast_weights[32] = {1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8,
                                            8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9};
 
+#define NUM_DIFFS 4
+#define NUM_ALL_DIFFS (2*NUM_DIFFS+1)
+static const int g_diffs_to_consider[NUM_DIFFS] = {1, 2, 3, 4};
+static const int g_diffs_weights[NUM_DIFFS] = {1, 2, 3, 4};
+static const int g_all_diffs[NUM_ALL_DIFFS] = {-4, -3, -2, -1, 0, 1, 2, 3, 4};
+static const uint16_t g_c_value_histogram_offset = 4; // = -g_all_diffs[0]
+
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #define CLAMP(x, low, high) (((x) > (high)) ? (high) : (((x) < (low)) ? (low) : (x)))
@@ -79,7 +86,6 @@ static const int g_contrast_weights[32] = {1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7
 typedef struct CambiBuffers {
     float *c_values;
     uint32_t *mask_dp;
-    uint16_t *c_values_histograms;
     uint16_t *filter_mode_buffer;
     uint16_t *diffs_to_consider;
     uint16_t *tvi_for_diff;
@@ -392,10 +398,6 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     adjust_window_size(&s->src_window_size, s->src_width, s->src_height);
     s->buffers.c_values = aligned_malloc(ALIGN_CEIL(alloc_w * sizeof(float)) * alloc_h, 32);
     if (!s->buffers.c_values) return -ENOMEM;
-
-    const uint16_t num_bins = 1024 + (s->buffers.all_diffs[2 * num_diffs] - s->buffers.all_diffs[0]);
-    s->buffers.c_values_histograms = aligned_malloc(ALIGN_CEIL(alloc_w * num_bins * sizeof(uint16_t)), 32);
-    if (!s->buffers.c_values_histograms) return -ENOMEM;
 
     int pad_size = MASK_FILTER_SIZE >> 1;
     int dp_width = alloc_w + 2 * pad_size + 1;
@@ -745,180 +747,85 @@ static void get_spatial_mask(const VmafPicture *image, VmafPicture *mask,
     get_spatial_mask_for_index(image, mask, dp, mask_index, MASK_FILTER_SIZE, width, height);
 }
 
-static float c_value_pixel(const uint16_t *histograms, uint16_t value, const int *diff_weights,
-                           const int *diffs, uint16_t num_diffs, const uint16_t *tvi_thresholds, int histogram_col, int histogram_width) {
-    uint16_t p_0 = histograms[value * histogram_width + histogram_col];
+static float c_value_pixel(const uint16_t *histogram, uint16_t value, const int *diff_weights,
+                           const int *diffs, uint16_t num_diffs, const uint16_t *tvi_thresholds)
+{
+    uint16_t p_0 = histogram[value];
     float val, c_value = 0.0;
-    for (uint16_t d = 0; d < num_diffs; d++) {
+    for (uint16_t d=0; d<num_diffs; d++) {
         if (value <= tvi_thresholds[d]) {
-            uint16_t p_1 = histograms[(value + diffs[num_diffs + d + 1]) * histogram_width + histogram_col];
-            uint16_t p_2 = histograms[(value + diffs[num_diffs - d - 1]) * histogram_width + histogram_col];
-            if (p_1 > p_2) {
+            uint16_t p_1 = histogram[value + diffs[num_diffs+d+1]];
+            uint16_t p_2 = histogram[value + diffs[num_diffs-d-1]];
+            if (p_1 > p_2)
                 val = (float)(diff_weights[d] * p_0 * p_1) / (p_1 + p_0);
-            }
-            else {
+            else
                 val = (float)(diff_weights[d] * p_0 * p_2) / (p_2 + p_0);
-            }
 
-            if (val > c_value) {
+            if (val > c_value)
                 c_value = val;
-            }
         }
     }
 
     return c_value;
 }
 
-static FORCE_INLINE inline void update_histogram_subtract_edge(uint16_t *histograms, uint16_t *image, uint16_t *mask,
-                                                          int i, int j, int width, ptrdiff_t stride, uint16_t pad_size,
-                                                          const uint16_t num_diffs, VmafRangeUpdater dec_range_callback) {
-    uint16_t mask_val = mask[(i - pad_size - 1) * stride + j];
-    if (mask_val) {
-        uint16_t val = image[(i - pad_size - 1) * stride + j] + num_diffs;
-        dec_range_callback(&histograms[val * width], MAX(j - pad_size, 0), MIN(j + pad_size + 1, width));
-    }
-}
-
-static FORCE_INLINE inline void update_histogram_subtract(uint16_t *histograms, uint16_t *image, uint16_t *mask,
-                                                          int i, int j, int width, ptrdiff_t stride, uint16_t pad_size,
-                                                          const uint16_t num_diffs, VmafRangeUpdater dec_range_callback) {
-    uint16_t mask_val = mask[(i - pad_size - 1) * stride + j];
-    if (mask_val) {
-        uint16_t val = image[(i - pad_size - 1) * stride + j] + num_diffs;
-        dec_range_callback(&histograms[val * width], j - pad_size, j + pad_size + 1);
-    }
-}
-
-static FORCE_INLINE inline void update_histogram_add_edge(uint16_t *histograms, uint16_t *image, uint16_t *mask,
-                                                     int i, int j, int width, ptrdiff_t stride, uint16_t pad_size,
-                                                     const uint16_t num_diffs, VmafRangeUpdater inc_range_callback) {
-    uint16_t mask_val = mask[(i + pad_size) * stride + j];
-    if (mask_val) {
-        uint16_t val = image[(i + pad_size) * stride + j] + num_diffs;
-        inc_range_callback(&histograms[val * width], MAX(j - pad_size, 0), MIN(j + pad_size + 1, width));
-    }
-}
-
-static FORCE_INLINE inline void update_histogram_add(uint16_t *histograms, uint16_t *image, uint16_t *mask,
-                                                     int i, int j, int width, ptrdiff_t stride, uint16_t pad_size,
-                                                     const uint16_t num_diffs, VmafRangeUpdater inc_range_callback) {
-    uint16_t mask_val = mask[(i + pad_size) * stride + j];
-    if (mask_val) {
-        uint16_t val = image[(i + pad_size) * stride + j] + num_diffs;
-        inc_range_callback(&histograms[val * width], j - pad_size, j + pad_size + 1);
-    }
-}
-
-static FORCE_INLINE inline void update_histogram_add_edge_first_pass(uint16_t *histograms, uint16_t *image, uint16_t *mask,
-                                                     int i, int j, int width, ptrdiff_t stride, uint16_t pad_size,
-                                                     const uint16_t num_diffs, VmafRangeUpdater inc_range_callback) {
-    uint16_t mask_val = mask[i * stride + j];
-    if (mask_val) {
-        uint16_t val = image[i * stride + j] + num_diffs;
-        inc_range_callback(&histograms[val * width], MAX(j - pad_size, 0), MIN(j + pad_size + 1, width));
-    }
-}
-
-static FORCE_INLINE inline void update_histogram_add_first_pass(uint16_t *histograms, uint16_t *image, uint16_t *mask,
-                                                     int i, int j, int width, ptrdiff_t stride, uint16_t pad_size,
-                                                     const uint16_t num_diffs, VmafRangeUpdater inc_range_callback) {
-    uint16_t mask_val = mask[i * stride + j];
-    if (mask_val) {
-        uint16_t val = image[i * stride + j] + num_diffs;
-        inc_range_callback(&histograms[val * width], j - pad_size, j + pad_size + 1);
-    }
-}
-
-static FORCE_INLINE inline void calculate_c_values_row(float *c_values, uint16_t *histograms, uint16_t *image,
-                                                       uint16_t *mask, int row, int width, ptrdiff_t stride,
-                                                       const uint16_t num_diffs, const uint16_t *tvi_for_diff,
-                                                       const int *diff_weights, const int *all_diffs) {
-    for (int col = 0; col < width; col++) {
-        if (mask[row * stride + col]) {
-            c_values[row * width + col] = c_value_pixel(
-                histograms, image[row * stride + col] + num_diffs, diff_weights, all_diffs, num_diffs, tvi_for_diff, col, width
-            );
-        }
-    }
+static void pic_add_offset(VmafPicture *pic, uint16_t offset,
+                           unsigned width, unsigned height)
+{
+    uint16_t *data = pic->data[0];
+    ptrdiff_t stride = pic->stride[0] >> 1;
+    for (unsigned i=0; i<height; i++)
+        for (unsigned j=0; j<width; j++)
+            data[i * stride + j] += offset;
 }
 
 static void calculate_c_values(VmafPicture *pic, const VmafPicture *mask_pic,
-                               float *c_values, uint16_t *histograms, uint16_t window_size,
-                               const uint16_t num_diffs, const uint16_t *tvi_for_diff,
-                               const int *diff_weights, const int *all_diffs, int width, int height,
-                               VmafRangeUpdater inc_range_callback, VmafRangeUpdater dec_range_callback) {
-
-    uint16_t pad_size = window_size >> 1;
-    const uint16_t num_bins = 1024 + (all_diffs[2*num_diffs] - all_diffs[0]);
-
+                               float *c_values, uint16_t window_size,
+                               const uint16_t *tvi_for_diff, unsigned width, unsigned height)
+{
+    uint16_t pad_size = window_size>>1;
+    const uint16_t num_bins = 1024 + (g_all_diffs[NUM_ALL_DIFFS-1] - g_all_diffs[0]);
     uint16_t *image = pic->data[0];
     uint16_t *mask = mask_pic->data[0];
-    ptrdiff_t stride = pic->stride[0] >> 1;
+    ptrdiff_t stride = pic->stride[0]>>1;
+    uint16_t *histogram = (uint16_t*) malloc(sizeof(uint16_t) * num_bins);
 
+    int w = (int)width;
+    int h = (int)height;
+
+    pic_add_offset(pic, g_c_value_histogram_offset, width, height);
     memset(c_values, 0.0, sizeof(float) * width * height);
 
-    // Use a histogram for each pixel in width
-    // histograms[i * width + j] accesses the j'th histogram, i'th value
-    // This is done for cache optimization reasons
-    memset(histograms, 0, width * num_bins * sizeof(uint16_t));
+    for (int i=0; i<h; i++) {
+        memset(histogram, 0, sizeof(uint16_t) * num_bins);
+        for (int r=-pad_size; r<=pad_size; r++)
+            for (int c=0; c<=pad_size; c++)
+                if (i+r>=0 && i+r<h)
+                    histogram[image[(i+r) * stride + c]] += mask[(i+r) * stride + c];
 
-    // First pass: first pad_size rows
-    for (int i = 0; i < pad_size; i++) {
-        for (int j = 0; j < pad_size; j++) {
-            update_histogram_add_edge_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-        }
-        for (int j = pad_size; j < width - pad_size - 1; j++) {
-            update_histogram_add_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-        }
-        for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++) {
-            update_histogram_add_edge_first_pass(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
+        // Set c_value for pixel
+        if (mask[i * stride])
+            c_values[i * width] = c_value_pixel(histogram, image[i * stride], g_diffs_weights,
+                                                g_all_diffs, NUM_DIFFS, tvi_for_diff);
+
+        for (int j=1; j<w; j++) {
+            // Update histogram: add elements of the new column & remove from the previous one
+            for (int r=-pad_size; r<=pad_size; r++) {
+                if (i+r>=0 && i+r<h && j-pad_size-1>=0)
+                    histogram[image[(i+r) * stride + j-pad_size-1]] -= mask[(i+r) * stride + j-pad_size-1];
+
+                if (i+r>=0 && i+r<h && j+pad_size<w)
+                    histogram[image[(i+r) * stride + j+pad_size]] += mask[(i+r) * stride + j+pad_size];
+            }
+
+            // Set c_value for pixel
+            if (mask[i * stride + j])
+                c_values[i * width + j] = c_value_pixel(histogram, image[i * stride + j], g_diffs_weights,
+                                                        g_all_diffs, NUM_DIFFS, tvi_for_diff);
         }
     }
 
-    // Iterate over all rows, unrolled into 3 loops to avoid conditions
-    for (int i = 0; i < pad_size + 1; i++) {
-        if (i + pad_size < height) {
-            for (int j = 0; j < pad_size; j++) {
-                update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-            }
-            for (int j = pad_size; j < width - pad_size - 1; j++) {
-                update_histogram_add(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-            }
-            for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++) {
-                update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-            }
-        }
-        calculate_c_values_row(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, diff_weights, all_diffs);
-    }
-    for (int i = pad_size + 1; i < height - pad_size; i++) {
-        for (int j = 0; j < pad_size; j++) {
-            update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, dec_range_callback);
-            update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-        }
-        for (int j = pad_size; j < width - pad_size - 1; j++) {
-            update_histogram_subtract(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, dec_range_callback);
-            update_histogram_add(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-        }
-        for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++) {
-            update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, dec_range_callback);
-            update_histogram_add_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, inc_range_callback);
-        }
-        calculate_c_values_row(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, diff_weights, all_diffs);
-    }
-    for (int i = height - pad_size; i < height; i++) {
-        if (i - pad_size - 1 >= 0) {
-            for (int j = 0; j < pad_size; j++) {
-                update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, dec_range_callback);
-            }
-            for (int j = pad_size; j < width - pad_size - 1; j++) {
-                update_histogram_subtract(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, dec_range_callback);
-            }
-            for (int j = MAX(width - pad_size - 1, pad_size); j < width; j++) {
-                update_histogram_subtract_edge(histograms, image, mask, i, j, width, stride, pad_size, num_diffs, dec_range_callback);
-            }
-        }
-        calculate_c_values_row(c_values, histograms, image, mask, i, width, stride, num_diffs, tvi_for_diff, diff_weights, all_diffs);
-    }
+    free(histogram);
 }
 
 static double average_topk_elements(const float *arr, int topk_elements) {
@@ -1029,9 +936,8 @@ static int cambi_score(VmafPicture *pics, uint16_t window_size, double topk,
 
         filter_mode(image, scaled_width, scaled_height, buffers.filter_mode_buffer);
 
-        calculate_c_values(image, mask, buffers.c_values, buffers.c_values_histograms, window_size,
-                           num_diffs, tvi_for_diff, buffers.diff_weights, buffers.all_diffs, scaled_width, scaled_height,
-                           inc_range_callback, dec_range_callback);
+        calculate_c_values(image, mask, buffers.c_values, window_size,
+                           tvi_for_diff, scaled_width, scaled_height);
 
         if (write_heatmaps) {
             int err = dump_c_values(heatmaps_files, buffers.c_values, scaled_width, scaled_height, scale, window_size,
@@ -1109,7 +1015,6 @@ static int close_cambi(VmafFeatureExtractor *fex) {
 
     aligned_free(s->buffers.tvi_for_diff);
     aligned_free(s->buffers.c_values);
-    aligned_free(s->buffers.c_values_histograms);
     aligned_free(s->buffers.mask_dp);
     aligned_free(s->buffers.filter_mode_buffer);
     aligned_free(s->buffers.diffs_to_consider);
