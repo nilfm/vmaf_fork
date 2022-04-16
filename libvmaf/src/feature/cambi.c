@@ -85,7 +85,6 @@ static const uint16_t g_c_value_histogram_offset = 4; // = -g_all_diffs[0]
 
 typedef struct CambiBuffers {
     float *c_values;
-    uint16_t *filter_mode_buffer;
     uint16_t *diffs_to_consider;
     uint16_t *tvi_for_diff;
     int *diff_weights;
@@ -402,9 +401,6 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     int dp_width = alloc_w + 2 * pad_size + 1;
     int dp_height = 2 * pad_size + 2;
 
-    s->buffers.filter_mode_buffer = aligned_malloc(ALIGN_CEIL(3 * alloc_w * sizeof(uint16_t)), 32);
-    if (!s->buffers.filter_mode_buffer) return -ENOMEM;
-
     if (s->heatmaps_path) {
         int err = mkdirp(s->heatmaps_path, 0770);
         if (err) return -EINVAL;
@@ -614,35 +610,58 @@ static void decimate(VmafPicture *image, unsigned width, unsigned height) {
     }
 }
 
-static inline uint16_t min3(uint16_t a, uint16_t b, uint16_t c) {
-    if (a <= b && a <= c) return a;
-    if (b <= c) return b;
-    return c;
-}
-
-static inline uint16_t mode3(uint16_t a, uint16_t b, uint16_t c) {
-    if (a == b || a == c) return a;
-    if (b == c) return b;
-    return min3(a, b, c);
-}
-
-static void filter_mode(const VmafPicture *image, int width, int height, uint16_t *buffer) {
-    uint16_t *data = image->data[0];
-    ptrdiff_t stride = image->stride[0] >> 1;
-    for (int i = 0; i < height; i++) {
-        int curr_line = i % 3;
-        buffer[curr_line * width + 0] = data[i * stride + 0];
-        for (int j = 1; j < width - 1; j++) {
-            buffer[curr_line * width + j] = mode3(data[i * stride + j - 1], data[i * stride + j], data[i * stride + j + 1]);
+static FORCE_INLINE inline uint16_t mode_selection(uint16_t *elems, uint8_t *hist) {
+    unsigned max_counts = 0;
+    uint16_t max_mode = 1024;
+    // Set the 9 entries to 0
+    for (int i = 0; i < 9; i++) {
+        hist[elems[i]] = 0;
+    }
+    // Increment the 9 entries and find the mode
+    for (int i = 0; i < 9; i++) {
+        uint16_t value = elems[i];
+        hist[value]++;
+        uint8_t count = hist[value];
+        if (count >= 5) {
+            return value;
         }
-        buffer[curr_line * width + width - 1] = data[i * stride + width - 1];
-
-        if (i > 1) {
-            for (int j = 0; j < width; j++) {
-                data[(i - 1) * stride + j] = mode3(buffer[0 * width + j], buffer[1 * width + j], buffer[2 * width + j]);
-            }
+        if (count > max_counts || (count == max_counts && value < max_mode)) {
+            max_counts = count;
+            max_mode = value;
         }
     }
+    return max_mode;
+}
+
+static void filter_mode(const VmafPicture *image, int width, int height) {
+    uint16_t *data = image->data[0];
+    ptrdiff_t stride = image->stride[0] >> 1;
+    uint16_t curr[9];
+    uint8_t *hist = malloc(1024 * sizeof(uint8_t));
+    uint16_t *buffer = malloc(3 * width * sizeof(uint16_t));
+    for (int i = 0; i < height + 2; i++) {
+        if (i < height) {
+            for (int j = 0; j < width; j++) {
+                // Get the 9 elements into an array for cache optimization
+                for (int row = 0; row < 3; row++) {
+                    for (int col = 0; col < 3; col++) {
+                        int clamped_row = CLAMP(i + row - 1, 0, height - 1);
+                        int clamped_col = CLAMP(j + col - 1, 0, width - 1);
+                        curr[3 * row + col] = data[clamped_row * stride + clamped_col];
+                    }
+                }
+                buffer[(i % 3) * width + j] = mode_selection(curr, hist);
+            }
+        }
+        if (i >= 2) {
+            uint16_t *dest = data + (i - 2) * stride;
+            uint16_t *src = buffer + ((i + 1) % 3) * width;
+            memcpy(dest, src, width * sizeof(uint16_t));
+        }
+    }
+
+    free(hist);
+    free(buffer);
 }
 
 static FORCE_INLINE inline uint16_t ceil_log2(uint32_t num) {
@@ -927,7 +946,7 @@ static int cambi_score(VmafPicture *pics, uint16_t window_size, double topk,
             decimate(mask, scaled_width, scaled_height);
         }
 
-        filter_mode(image, scaled_width, scaled_height, buffers.filter_mode_buffer);
+        filter_mode(image, scaled_width, scaled_height);
 
         calculate_c_values(image, mask, buffers.c_values, window_size,
                            tvi_for_diff, scaled_width, scaled_height);
@@ -1008,7 +1027,6 @@ static int close_cambi(VmafFeatureExtractor *fex) {
 
     aligned_free(s->buffers.tvi_for_diff);
     aligned_free(s->buffers.c_values);
-    aligned_free(s->buffers.filter_mode_buffer);
     aligned_free(s->buffers.diffs_to_consider);
     aligned_free(s->buffers.diff_weights);
     aligned_free(s->buffers.all_diffs);
