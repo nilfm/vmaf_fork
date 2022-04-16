@@ -429,14 +429,6 @@ static int init(VmafFeatureExtractor *fex, enum VmafPixelFormat pix_fmt,
     s->inc_range_callback = increment_range;
     s->dec_range_callback = decrement_range;
 
-#if ARCH_X86
-    unsigned flags = vmaf_get_cpu_flags();
-    if (flags & VMAF_X86_CPU_FLAG_AVX2) {
-        s->inc_range_callback = cambi_increment_range_avx2;
-        s->dec_range_callback = cambi_decrement_range_avx2;
-    }
-#endif
-
     return err;
 }
 
